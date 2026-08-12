@@ -1,0 +1,1008 @@
+---
+title: "Choosing the right statistical model (v1.2)"
+subtitle: "A short roadmap using sociable weavers"
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    df_print: paged
+---
+
+```{r setup, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(emmeans)
+
+set.seed(331)
+```
+
+```{r nest-photo, echo=FALSE, fig.align="center", out.width="70%"}
+
+knitr::include_graphics("sociable_weaver_nest.jpg")
+
+```
+
+# Our mock dataset
+
+Here you will analyse **one mock sociable-weaver dataset in lots of different ways**.
+
+The point is not to memorise a long list of tests. The point is to see that most of the tests you already know are versions of the same modelling framework.
+
+For each tree we record:
+
+- `TreeType`: Camelthorn or Shepherd's tree
+- `NestHeight`: height of the communal nest above the ground
+- `NestSize`: Small, Medium or Large
+- `Temperature`: temperature measured at the nest
+- `Predator`: whether a pygmy falcon was present (`0 = absent`, `1 = present`)
+- `NestChambers`: number of individual nesting chambers in the communal nest
+
+The data are **simulated for teaching**. I have deliberately built clear effects into them so that we can concentrate on understanding the models.
+
+```{r make-data}
+n_per_group <- 40
+
+weaver <- expand_grid(
+  TreeType = c("Camelthorn", "Shepherd"),
+  NestSize = c("Small", "Medium", "Large"),
+  Replicate = 1:n_per_group
+) %>%
+  mutate(
+    Tree = row_number(),
+    TreeType = factor(TreeType),
+    NestSize = factor(NestSize,
+                      levels = c("Small", "Medium", "Large")),
+
+    # Continuous explanatory variable
+    NestHeight = runif(n(), 2, 7),
+
+    # CONTINUOUS RESPONSE
+    # Effects of height, tree type and nest size,
+    # plus two interactions that we will test later.
+    # The NestSize x TreeType interaction is deliberately strong
+    # and criss-crossing to make the idea of an interaction obvious.
+    Temperature =
+      24 +
+      0.9 * NestHeight +
+      5.5 * (TreeType == "Shepherd") +
+      4.0 * (NestSize == "Medium") +
+      10.0 * (NestSize == "Large") -
+      6.0 * (TreeType == "Shepherd" & NestSize == "Medium") -
+      14.0 * (TreeType == "Shepherd" & NestSize == "Large") +
+      1.0 * NestHeight * (TreeType == "Shepherd") +
+      rnorm(n(), 0, 1),
+
+    # BINARY RESPONSE
+    # Pygmy falcon presence depends on height and tree type
+    prob_predator = plogis(
+      -4.4 +
+      0.65 * NestHeight +
+      1.25 * (TreeType == "Shepherd")
+    ),
+    Predator = rbinom(n(), 1, prob_predator),
+
+    # COUNT RESPONSE
+    # Number of individual chambers depends on nest size,
+    # height and tree type
+    expected_chambers = exp(
+      2.9 +
+      0.10 * NestHeight +
+      0.22 * (TreeType == "Shepherd") +
+      0.25 * (NestSize == "Medium") +
+      0.55 * (NestSize == "Large")
+    ),
+    NestChambers = rpois(n(), expected_chambers)
+  ) %>%
+  select(-Replicate, -prob_predator, -expected_chambers)
+
+weaver
+```
+
+## First, let's make sure the columns have the right type
+
+R needs to know what kind of variable each column represents.
+
+For this practical, keep it simple:
+
+| Variable type | Example | R type |
+|:---|:---|:---|
+| Categorical | `TreeType`, `NestSize` | `factor` |
+| Binary response | `Predator` coded 0/1 | numeric 0/1 |
+| Continuous | `Temperature`, `NestHeight` | numeric |
+| Counts | `NestChambers` | non-negative whole numbers |
+
+You can check this with:
+
+```{r check-types}
+glimpse(weaver)
+```
+
+A common mistake is to leave a categorical variable as numbers such as `1`, `2`, `3`.  
+R may then treat it as continuous. If the numbers are really group labels, convert them to a factor:
+
+```r
+weaver$NestSize <- factor(weaver$NestSize)
+```
+
+---
+
+
+# Before we start: parametric and non-parametric tests
+
+There are two broad traditions you have probably encountered.
+
+**Parametric tests** assume that the response follows some probability distribution. For example:
+
+- Normal (Gaussian) for a continuous response
+- Binomial for a `0/1` response
+- Poisson for counts
+
+These are the models we focus on here.
+
+**Non-parametric tests**, such as Wilcoxon and Kruskal-Wallis, mainly use the **ranks** of observations instead of modelling the response directly. They can be useful, but they are much less flexible when you want several predictors, interactions or random effects.
+
+We will come back to them briefly at the end.
+
+---
+
+# The idea: One model to unite them all
+
+The goal of this practical is **not** to learn lots of different statistical tests.
+
+The goal is to realise that most of the methods you already know are simply different versions of **one statistical model**.
+
+Everything starts from the same formula:
+
+```r
+Response ~ Predictors
+```
+
+or, in R:
+
+```r
+glm(
+  Response ~ Predictors,
+  family = ...
+)
+```
+
+As we go through the practical, notice what changes—and, more importantly, what **doesn't**.
+
+There are only three questions to ask:
+
+1. **What is my response variable?**
+2. **What explanatory variables do I have?**
+3. **Are my observations independent?**
+
+Everything else follows naturally.
+
+Throughout the first half of this practical we will keep the **response variable exactly the same** (`Temperature`) and only change the explanatory variables.
+
+
+| Formula | Classical name |
+|:---|:---|
+| `Temperature ~ NestHeight` | Linear regression |
+| `Temperature ~ TreeType` | t-test |
+| `Temperature ~ NestSize` | One-way ANOVA |
+| `Temperature ~ TreeType + NestSize + TreeType:NestSize` | Two-way ANOVA |
+| `Temperature ~ NestHeight + TreeType + NestHeight:TreeType` | ANCOVA |
+
+Notice that the response never changes—only the predictors.
+
+Only later will we change the response (to a binary or count variable). The model stays exactly the same; only the **family** changes.
+
+---
+
+# 1. Continuous response + continuous explanatory variable
+
+## Biological question
+
+> Does nest temperature change with nest height?
+
+```text
+Response:     Temperature   -> continuous
+Explanatory:  NestHeight    -> continuous
+```
+
+First, **look at the data**:
+
+```{r regression-plot}
+ggplot(weaver, aes(NestHeight, Temperature)) +
+  geom_point() +
+  geom_smooth(method = "lm")
+```
+
+## Classical name: linear regression
+
+The familiar classical approach is:
+
+```{r regression-lm}
+m_reg <- lm(
+  Temperature ~ NestHeight,
+  data = weaver
+)
+
+summary(m_reg)
+```
+
+## The GLM way
+
+The same model can be written as a Gaussian GLM:
+
+```{r regression-glm}
+m_reg_glm <- glm(
+  Temperature ~ NestHeight,
+  family = gaussian,
+  data = weaver
+)
+
+summary(m_reg_glm)
+```
+
+Compare the coefficients:
+
+```{r regression-compare}
+coef(m_reg)
+coef(m_reg_glm)
+```
+
+These are two ways of fitting the same Gaussian linear model. `lm()` uses ordinary least squares, whereas `glm(..., family = gaussian)` uses the more general GLM fitting machinery. Here they give the same coefficient estimates.
+
+> **Linear regression is a Gaussian GLM with a continuous predictor.**
+
+---
+
+# 2. Continuous response + a categorical variable with TWO levels
+
+## Biological question
+
+> Does nest temperature differ between Camelthorn and Shepherd's trees?
+
+```text
+Response:     Temperature  -> continuous
+Explanatory:  TreeType     -> categorical, 2 levels
+```
+
+First, **look at the data**:
+
+```{r ttest-plot}
+ggplot(weaver, aes(TreeType, Temperature)) +
+  geom_boxplot()
+```
+
+## Classical name: two-sample t-test
+
+```{r ttest-classical}
+t.test(
+  Temperature ~ TreeType,
+  data = weaver,
+  var.equal = TRUE
+)
+```
+
+## The GLM way
+
+```{r ttest-lm}
+m_ttest <- glm(
+  Temperature ~ TreeType,
+  family = gaussian,
+  data = weaver
+)
+
+summary(m_ttest)
+```
+
+The classical equal-variance t-test and the Gaussian GLM are testing the same difference between two group means.
+
+> **A t-test is a Gaussian GLM with a two-level categorical predictor.**
+
+---
+
+# 3. Continuous response + a categorical variable with MORE than two levels
+
+## Biological question
+
+> Does nest temperature differ among Small, Medium and Large nests?
+
+```text
+Response:     Temperature  -> continuous
+Explanatory:  NestSize     -> categorical, 3 levels
+```
+
+First, **look at the data**:
+
+```{r anova-plot}
+ggplot(weaver, aes(NestSize, Temperature)) +
+  geom_boxplot()
+```
+
+## Classical name: one-way ANOVA
+
+```{r anova-classical}
+m_aov <- aov(
+  Temperature ~ NestSize,
+  data = weaver
+)
+
+summary(m_aov)
+```
+
+## The GLM way
+
+```{r anova-lm}
+m_anova <- glm(
+  Temperature ~ NestSize,
+  family = gaussian,
+  data = weaver
+)
+
+summary(m_anova)
+```
+
+> **ANOVA is a Gaussian GLM with a categorical predictor.**
+
+If the overall effect is supported, we may also want to ask **which levels differ from one another**. We will come back to post-hoc comparisons in Section 8.
+
+---
+
+# 4. Two categorical predictors and an interaction
+
+## Biological question
+
+> Does the effect of nest size on temperature differ between Camelthorn and Shepherd's trees?
+
+```text
+Response:      Temperature
+Explanatory 1: TreeType   -> categorical
+Explanatory 2: NestSize   -> categorical
+Interaction:   TreeType:NestSize
+```
+
+First, **look at the data**:
+
+```{r categorical-interaction-plot}
+ggplot(weaver,
+       aes(NestSize, Temperature,
+           colour = TreeType,
+           group = TreeType)) +
+  stat_summary(fun = mean, geom = "line") +
+  stat_summary(fun = mean, geom = "point") +
+  stat_summary(fun.data = mean_cl_normal,
+               geom = "errorbar",
+               width = 0.1)
+```
+
+Here the lines actually **cross**: temperature increases with nest size in one tree type but decreases in the other. This is an especially clear example of an interaction.
+
+In real data, interactions do not have to cross. Any clear departure from parallel patterns can indicate that the effect of one predictor depends on the other.
+
+## Classical name: two-way ANOVA with an interaction
+
+## The GLM way
+
+```{r categorical-interaction-model}
+m_anova_int <- glm(
+  Temperature ~ TreeType + NestSize + TreeType:NestSize,
+  family = gaussian,
+  data = weaver
+)
+
+summary(m_anova_int)
+```
+
+The interaction is written explicitly as:
+
+```r
+TreeType:NestSize
+```
+
+So the model contains the effects of `TreeType`, `NestSize`, and their interaction.
+
+---
+
+# 5. Continuous + categorical predictors
+
+## Biological question
+
+> Does temperature change with nest height, and is that relationship different between tree types?
+
+```text
+Response:      Temperature  -> continuous
+Explanatory 1: NestHeight   -> continuous
+Explanatory 2: TreeType     -> categorical
+Interaction:   NestHeight:TreeType
+```
+
+First, **look at the data**:
+
+```{r ancova-plot}
+ggplot(weaver,
+       aes(NestHeight, Temperature,
+           colour = TreeType)) +
+  geom_point() +
+  geom_smooth(method = "lm")
+```
+
+Here we can already ask whether the slopes look different between tree types.
+
+## Classical name: ANCOVA
+
+## The GLM way
+
+```{r ancova-model}
+m_ancova <- glm(
+  Temperature ~ NestHeight + TreeType + NestHeight:TreeType,
+  family = gaussian,
+  data = weaver
+)
+
+summary(m_ancova)
+```
+
+Nothing fundamentally new has happened. This is simply a Gaussian GLM containing a continuous predictor, a categorical predictor, and an interaction.
+
+> **Regression, t-test, ANOVA and ANCOVA are all versions of the same GLM framework.**
+
+---
+
+# 6. Binary response: 0 or 1
+
+## Biological question
+
+> Is pygmy falcon presence related to tree type?
+
+Our response is:
+
+```text
+Predator = 0   pygmy falcon absent
+Predator = 1   pygmy falcon present
+```
+
+```text
+Response:     Predator  -> binary, 0/1
+Explanatory:  TreeType  -> categorical
+```
+
+First, **look at the data**. For a binary response, it is useful to plot the proportion of trees with a predator:
+
+```{r binomial-plot}
+predator_plot <- weaver %>%
+  group_by(TreeType) %>%
+  summarise(
+    p = mean(Predator),
+    se = sqrt(p * (1 - p) / n())
+  )
+
+ggplot(predator_plot, aes(TreeType, p)) +
+  geom_point() +
+  geom_errorbar(
+    aes(ymin = p - 1.96 * se,
+        ymax = p + 1.96 * se),
+    width = 0.1
+  ) +
+  ylim(0, 1)
+```
+
+## Classical name: logistic regression
+
+You may also be familiar with analysing two categorical variables using a contingency table and a chi-square test. Here we use logistic regression because it extends naturally to additional predictors and interactions.
+
+## The GLM way
+
+Because the response is `0/1`, we use a **binomial GLM**:
+
+```{r binomial-model}
+m_binom <- glm(
+  Predator ~ TreeType,
+  family = binomial,
+  data = weaver
+)
+
+summary(m_binom)
+```
+
+And we can immediately extend the same model:
+
+```{r binomial-two-predictors}
+m_binom2 <- glm(
+  Predator ~ TreeType + NestHeight,
+  family = binomial,
+  data = weaver
+)
+
+summary(m_binom2)
+```
+
+The modelling framework has not changed. Only the response distribution has.
+
+---
+
+# 7. Count response
+
+## Biological question
+
+> Does the number of individual chambers differ among nest-size categories?
+
+Our response is the number of individual nesting chambers in the communal nest:
+
+```text
+18, 27, 41, 56, ...
+```
+
+```text
+Response:     NestChambers  -> count
+Explanatory:  NestSize      -> categorical
+```
+
+First, **look at the data**:
+
+```{r poisson-plot}
+ggplot(weaver, aes(NestSize, NestChambers, fill = TreeType)) +
+  geom_boxplot(position = position_dodge(width = 0.8))
+```
+
+## Classical name: Poisson regression
+
+Poisson regression is the standard GLM starting point for count responses.
+
+## The GLM way
+
+```{r poisson-model}
+m_pois <- glm(
+  NestChambers ~ NestSize,
+  family = poisson,
+  data = weaver
+)
+
+summary(m_pois)
+```
+
+And again, we can easily add another predictor and an interaction:
+
+```{r poisson-more}
+m_pois2 <- glm(
+  NestChambers ~ NestSize + TreeType + NestSize:TreeType,
+  family = poisson,
+  data = weaver
+)
+
+summary(m_pois2)
+```
+
+There is no need to invent a new statistical test every time you add another explanatory variable.
+
+---
+
+# 8. Testing and reporting effects
+
+So far we have focused on **choosing and fitting the model**.
+
+Now we ask whether the effects in the model are supported by the data, and how we would report them. The basic sequence is:
+
+> **Fit the model -> test the effect -> if needed, compare factor levels -> report the biological result and the statistical evidence.**
+
+### A simple reporting rule for this course
+
+For this field course, keep the Results sentence simple:
+
+> **Biological result + test statistic + p-value**
+
+For example:
+
+> Nest temperature increased significantly with nest height (*F* = 46.27, *p* < 0.001).
+
+That is enough for your field-course report.
+
+In a scientific paper, statistical reporting is usually more complete. Depending on the analysis and journal, you would normally also report the **model/test used, degrees of freedom, and often the estimated effect size and its uncertainty**. For example:
+
+> Nest temperature increased with nest height (Gaussian GLM: $\beta$ = 1.53 $\pm$ 0.23 SE, *F*~1,238~ = 46.27, *p* < 0.001).
+
+For this course, however, you do **not** need to report all of that.
+
+Use the same simple convention throughout:
+
+- Gaussian models: `F = ..., p = ...`
+- Binomial and Poisson models: `χ² = ..., p = ...`
+- Post-hoc comparisons: state which groups differ and give `p = ...`
+
+If R gives you a very small p-value such as `8.3e-11`, report it simply as **p < 0.001**.
+
+
+## Gaussian models
+
+For Gaussian GLMs, use an F-test:
+
+```{r gaussian-anova}
+anova(m_reg_glm, test = "F")
+anova(m_anova, test = "F")
+anova(m_anova_int, test = "F")
+anova(m_ancova, test = "F")
+```
+
+For example, the first test asks whether nest height explains variation in temperature.
+
+```{r report-regression, echo=FALSE}
+reg_test <- anova(m_reg_glm, test = "F")
+reg_row <- which(rownames(reg_test) == "NestHeight")
+reg_F <- reg_test$`F`[reg_row]
+reg_p <- reg_test$`Pr(>F)`[reg_row]
+```
+
+### How would I report this?
+
+A good Results sentence gives the **biological pattern first**, followed by the statistical evidence.
+
+> Nest temperature increased significantly with nest height (*F* = `r round(reg_F, 2)`, *p* `r if (reg_p < 0.001) "< 0.001" else paste("=", round(reg_p, 3))`).
+
+Avoid writing only *"there was a significant effect (p < 0.05)"*. Tell the reader **what changed and in which direction**.
+
+## Categorical effects: which levels differ?
+
+The overall ANOVA tells us whether there is evidence that the groups differ somewhere. If a factor has more than two levels, we may then want to know **which levels differ**.
+
+You may already know the classical Tukey post-hoc test:
+
+```{r tukey-classical}
+TukeyHSD(m_aov)
+```
+
+But because we want to stay within **one modelling framework**, we can make the comparisons directly from our GLM using estimated marginal means:
+
+```{r emmeans-anova}
+emmeans(
+  m_anova,
+  pairwise ~ NestSize,
+  adjust = "tukey"
+)
+```
+
+This approach also extends naturally to more complicated GLMs. For example, if there is an interaction, we can compare nest sizes **within each tree type**:
+
+```{r emmeans-interaction}
+emmeans(
+  m_anova_int,
+  pairwise ~ NestSize | TreeType,
+  adjust = "tukey"
+)
+```
+
+```{r report-anova, echo=FALSE}
+anova_size <- anova(m_anova, test = "F")
+size_row <- which(rownames(anova_size) == "NestSize")
+size_F <- anova_size$`F`[size_row]
+size_p <- anova_size$`Pr(>F)`[size_row]
+size_emm <- emmeans(m_anova, ~ NestSize)
+size_pairs <- as.data.frame(pairs(size_emm, adjust = "tukey"))
+```
+
+### How would I report this?
+
+> Nest temperature differed significantly among nest-size categories (*F* = `r round(size_F, 2)`, *p* `r if (size_p < 0.001) "< 0.001" else paste("=", round(size_p, 3))`). Tukey-adjusted comparisons of estimated marginal means showed that `r size_pairs$contrast[which.min(size_pairs$p.value)]` differed significantly (*p* `r if (min(size_pairs$p.value) < 0.001) "< 0.001" else paste("=", round(min(size_pairs$p.value), 3))`).
+
+For a report, you do not need to list every pairwise comparison in the text. Report the comparisons that are biologically relevant and show the full output in a table if necessary.
+
+## Interactions
+
+Interactions need a little more care, but the basic reporting rule stays the same:
+
+1. **Describe the biological pattern first.**
+2. Report the statistical evidence for the interaction.
+3. Then describe any component patterns that help explain it.
+
+A significant interaction does **not** mean that the individual predictors suddenly become meaningless. It means that their effects cannot always be described as one universal effect that is the same at every level of the other predictor.
+
+### A very clear interaction: two categorical predictors
+
+In our `NestSize × TreeType` example, the plotted lines cross: temperature increases with nest size in Camelthorn trees but decreases with nest size in Shepherd's trees.
+
+```{r report-categorical-interaction, echo=FALSE}
+cat_int_test <- anova(m_anova_int, test = "F")
+cat_int_row <- which(rownames(cat_int_test) == "TreeType:NestSize")
+cat_int_F <- cat_int_test$`F`[cat_int_row]
+cat_int_p <- cat_int_test$`Pr(>F)`[cat_int_row]
+```
+
+### How would I report this?
+
+> The relationship between nest size and temperature differed between tree types: temperature increased with nest size in Camelthorn trees but decreased in Shepherd's trees (*F* = `r round(cat_int_F, 2)`, *p* `r if (cat_int_p < 0.001) "< 0.001" else paste("=", round(cat_int_p, 3))`).
+
+That is the clearest kind of interaction because the biological pattern actually reverses.
+
+### But interactions do not have to reverse the effect
+
+In our `NestHeight × TreeType` example, temperature increases with height in **both** tree types, but more steeply in Shepherd's trees.
+
+```{r report-interaction, echo=FALSE}
+int_test <- anova(m_ancova, test = "F")
+int_row <- which(rownames(int_test) == "NestHeight:TreeType")
+int_F <- int_test$`F`[int_row]
+int_p <- int_test$`Pr(>F)`[int_row]
+
+int_coef <- coef(m_ancova)
+slope_camel <- int_coef["NestHeight"]
+slope_shepherd <- int_coef["NestHeight"] + int_coef["NestHeight:TreeTypeShepherd"]
+mean_height <- mean(weaver$NestHeight)
+tree_diff_mean <- int_coef["TreeTypeShepherd"] +
+  int_coef["NestHeight:TreeTypeShepherd"] * mean_height
+```
+
+### How would I report this?
+
+> Temperature increased with nest height in both tree types, but the increase was steeper in Shepherd's trees than in Camelthorn trees (*F* = `r round(int_F, 2)`, *p* `r if (int_p < 0.001) "< 0.001" else paste("=", round(int_p, 3))`). Across the observed range, Shepherd's-tree nests were also generally warmer.
+
+So the practical rule is:
+
+> **An interaction changes how you describe the individual effects; it does not tell you to ignore them.**
+
+If the interaction changes the **strength** of an effect, say so. If it changes the **direction** of an effect, say so. And if there is still a clear biological difference between groups across the observed range, you can describe that too.
+
+One technical detail is worth knowing: when an interaction is present, a coefficient such as `TreeType` in `summary()` refers to the tree-type difference when `NestHeight = 0`. If zero is outside the observed range, that particular coefficient may not be biologically useful. In that case, rely on the plotted relationship and comparisons at meaningful values.
+
+For categorical interactions, `emmeans()` can be used to compare levels within each group, as shown above. For continuous interactions, the plot is often the clearest first interpretation.
+
+## Binomial and Poisson GLMs
+
+For Binomial and Poisson GLMs, use a likelihood-ratio chi-square test:
+
+```{r glm-anova}
+anova(m_binom2, test = "Chisq")
+anova(m_pois2, test = "Chisq")
+```
+
+There is no need to run a separate `chisq.test()`. Here, chi-square is the reference distribution used to test changes in model deviance.
+
+One important R detail: `anova(model)` by itself shows changes in deviance but does **not** automatically give p-values for these GLMs. Use:
+
+```r
+anova(model, test = "Chisq")
+```
+
+```{r report-binomial-poisson, echo=FALSE}
+bin_test <- anova(m_binom2, test = "Chisq")
+bin_row <- which(rownames(bin_test) == "TreeType")
+bin_chi <- bin_test$Deviance[bin_row]
+bin_p <- bin_test$`Pr(>Chi)`[bin_row]
+
+pois_test <- anova(m_pois2, test = "Chisq")
+pois_row <- which(rownames(pois_test) == "NestSize:TreeType")
+pois_chi <- pois_test$Deviance[pois_row]
+pois_p <- pois_test$`Pr(>Chi)`[pois_row]
+```
+
+### How would I report these?
+
+> Pygmy falcon presence differed significantly between tree types after accounting for nest height ($\chi^2$ = `r round(bin_chi, 2)`, *p* `r if (bin_p < 0.001) "< 0.001" else paste("=", round(bin_p, 3))`).
+
+> `r if (pois_p < 0.05) "The relationship between nest size and the number of nest chambers differed between tree types" else "There was no evidence that the relationship between nest size and the number of nest chambers differed between tree types"` ($\chi^2$ = `r round(pois_chi, 2)`, *p* `r if (pois_p < 0.001) "< 0.001" else paste("=", round(pois_p, 3))`).
+
+## A small warning about `anova()`
+
+Base R `anova()` is sequential (Type I), so terms are tested in the order in which they occur in the model. For the simple balanced examples here, that is fine.
+
+With a strongly **unbalanced design**, the order of terms can matter. A common alternative is `Anova()` from the **car** package:
+
+```r
+library(car)
+Anova(model, type = 2)
+```
+
+You do not need to worry much about this now, but it is useful to know why `anova()` and `Anova()` can sometimes give different answers.
+
+---
+
+# 9. Another approach: compare whole models using AIC
+
+So far we have used **hypothesis testing**:
+
+> Is this particular effect significant?
+
+There is another common approach in ecology: **information-theoretic model comparison**.
+
+Now the question becomes:
+
+> Which biological model is best supported by the data?
+
+For example, suppose we have four hypotheses about temperature:
+
+```{r aic-models}
+m0 <- glm(
+
+  Temperature ~ 1,
+  data = weaver,
+  family = gaussian)
+
+m1 <- glm(
+
+  Temperature ~ NestHeight,
+  data = weaver,
+  family = gaussian)
+
+m2 <- glm(
+
+  Temperature ~ NestHeight + TreeType,
+  data = weaver,
+  family = gaussian)
+
+m3 <- glm(
+
+  Temperature ~ NestHeight + TreeType + NestHeight:TreeType,
+  data = weaver,
+  family = gaussian)
+```
+
+Compare them:
+
+```{r aic-comparison}
+AIC(m0, m1, m2, m3)
+```
+
+The model with the **lowest AIC** has the strongest support among the models being compared.
+
+It is also useful to calculate **Delta AIC**:
+
+```{r delta-aic}
+aic_table <- AIC(m0, m1, m2, m3) %>%
+  rownames_to_column("Model") %>%
+  mutate(
+    DeltaAIC = AIC - min(AIC)
+  )
+
+aic_table
+```
+
+A rough rule of thumb:
+
+```text
+Delta AIC < 2       similar support
+Delta AIC 2 - 7     less support
+Delta AIC > 10      very little support
+```
+
+AIC and p-values ask somewhat different questions.
+
+**P-value approach:**
+
+> Is there evidence for this effect?
+
+**AIC approach:**
+
+> Which of these competing models gives the best balance between fit and complexity?
+
+Neither approach replaces thinking about the biology.
+
+## A quick AIC shortcut: `drop1()`
+
+If you already have a full model and want a quick look at what happens when each predictor is removed, `drop1()` is useful:
+
+```{r aic-drop1}
+drop_aic <- drop1(m_pois2)
+drop_aic
+```
+
+The `<none>` row is the full model. Each other row shows the AIC after removing that term. If removing a predictor makes AIC substantially larger, the data support keeping that predictor in the model.
+
+```{r report-drop1, echo=FALSE}
+full_aic <- drop_aic["<none>", "AIC"]
+delta_drop <- drop_aic[, "AIC"] - full_aic
+names(delta_drop) <- rownames(drop_aic)
+
+# Ignore the <none> row when looking for the largest change
+delta_terms <- delta_drop[names(delta_drop) != "<none>"]
+most_important <- names(which.max(delta_terms))
+most_delta <- max(delta_terms)
+```
+
+### How would I report this?
+
+> In this model, removing `r most_important` produced the largest increase in AIC ($\Delta$AIC = `r round(most_delta, 1)`), indicating less support for the reduced model.
+
+`drop1()` is a convenient shorthand, but it should not replace biologically motivated model building. In particular, do not remove a main effect while retaining an interaction that contains it.
+
+---
+
+# 10. What about model diagnostics and non-parametric tests?
+
+Before choosing a non-parametric test, one important point:
+
+> **In this short lesson we are mostly ignoring model diagnostics. In a real analysis, you should check whether the model fits the data reasonably well.**
+
+For linear models this usually means looking at the **residuals** for strong departures from Normality, unequal variance or other obvious patterns. For binomial and Poisson GLMs there are different diagnostics, including checking for things such as **overdispersion**.
+
+Remember that these assumptions concern the **model residuals after accounting for the predictors**, not simply the appearance of the raw response variable.
+
+We are also not going into **transforming response variables** (for example log transformations) here. Those are useful topics, but they would distract from today's main goal: understanding how the common statistical tests fit into one modelling framework.
+
+We said at the beginning that here we were mainly focusing on **parametric models**.
+
+Two common non-parametric alternatives are:
+
+| Parametric test | Common non-parametric alternative |
+|:---|:---|
+| Two-sample t-test | Wilcoxon rank-sum test |
+| One-way ANOVA | Kruskal-Wallis test |
+
+For example:
+
+```{r non-parametric}
+wilcox.test(
+  Temperature ~ TreeType,
+  data = weaver
+)
+
+kruskal.test(
+  Temperature ~ NestSize,
+  data = weaver
+)
+```
+
+These tests work mainly with **ranks** rather than modelling the response directly.
+
+They can be useful, but they are less flexible.
+
+For example, it is easy to write:
+
+```r
+Temperature ~ NestHeight + TreeType + NestHeight:TreeType
+```
+
+in a linear model.
+
+There is no equally simple Wilcoxon version of that model.
+
+So do **not** automatically jump to a non-parametric test just because your raw data do not look perfectly Normal.
+
+For linear models, what matters more is whether the **model residuals** behave reasonably.
+
+---
+
+# 11. The roadmap
+
+Whenever you analyse a dataset, start by writing your biological model:
+
+```r
+Response ~ Predictors
+```
+
+Then ask yourself four simple questions.
+
+| Question | Why does it matter? |
+|:---|:---|
+| **What is my response variable?** | Chooses the model family (Gaussian, Binomial or Poisson). |
+| **What are my predictors?** | Defines the model formula. |
+| **Are the observations independent?** | If not, consider a mixed-effects model. |
+| **How will I compare models?** | Use p-values or AIC, depending on your question. |
+
+# The GLM framework
+
+Many classical statistical tests are simply special cases of a GLM.
+
+| Classical name | GLM formulation |
+|:---|:---|
+| Linear regression | `glm(y ~ x, family = gaussian)` *(or `lm()`)* |
+| t-test | `glm(y ~ group, family = gaussian)` |
+| ANOVA | `glm(y ~ group, family = gaussian)` |
+| Two-way ANOVA | `glm(y ~ A + B + A:B, family = gaussian)` |
+| ANCOVA | `glm(y ~ x + group + x:group, family = gaussian)` |
+| Logistic regression | `glm(..., family = binomial)` |
+| Poisson regression | `glm(..., family = poisson)` |
+
+# Final message
+
+Think about **models**, not **tests**.
+
+Start with the biological question, write down the model,
+
+```r
+glm(
+  Response ~ Predictors,
+  family = ...
+)
+```
+
+and then choose:
+
+- the appropriate **family**,
+- the appropriate **predictors**,
+- whether **random effects** are needed (next lesson),
+- and how you want to compare models (p-values or AIC).
+
+Finally, remember that every model should be checked with appropriate diagnostics before interpreting the results.
